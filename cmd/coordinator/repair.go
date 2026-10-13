@@ -30,7 +30,7 @@ func (c *coordinator) repairOnce() {
 			var src []nodeRef
 			for _, id := range ch.Nodes {
 				if nd := c.snap.Nodes[id]; nd != nil && c.onlineLocked(nd) {
-					src = append(src, nodeRef{nd.ID, nd.Addr, nd.Key})
+					src = append(src, nodeRef{nd.ID})
 				}
 			}
 			if len(src) > 0 && len(src) < c.repl {
@@ -48,7 +48,7 @@ func (c *coordinator) repairOnce() {
 func (c *coordinator) repairChunk(j repairJob) {
 	var data []byte
 	for _, s := range j.sources {
-		b, err := getChunk(s, j.chunk.ID)
+		b, err := c.getChunk(s, j.chunk.ID)
 		if err != nil {
 			continue
 		}
@@ -78,7 +78,7 @@ func (c *coordinator) repairChunk(j repairJob) {
 	c.mu.Unlock()
 
 	for _, t := range targets {
-		err := putChunk(t, j.chunk.ID, data)
+		err := c.putChunk(t, j.chunk.ID, data)
 		c.mu.Lock()
 		if err != nil || c.snap.Files[j.fileID] == nil {
 			c.releaseLocked(t.ID, j.chunk.Size)

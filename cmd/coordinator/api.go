@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,8 +22,11 @@ import (
 func (c *coordinator) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/users", c.registerUser)
+	mux.HandleFunc("GET /api/me", c.me)
+	mux.HandleFunc("PUT /api/keyinfo", c.setKeyInfo)
 	mux.HandleFunc("POST /api/nodes/register", c.registerNode)
-	mux.HandleFunc("POST /api/nodes/heartbeat", c.heartbeat)
+	mux.HandleFunc("GET /api/nodes/poll", c.pollJob)
+	mux.HandleFunc("POST /api/nodes/result", c.jobResult)
 	mux.HandleFunc("GET /api/nodes", c.listNodes)
 	mux.HandleFunc("GET /api/stats", c.stats)
 	mux.HandleFunc("POST /api/files", c.upload)
@@ -44,6 +48,27 @@ func (c *coordinator) auth(r *http.Request) *User {
 	return c.snap.Users[tok]
 }
 
+// authNode checks node id + key and refreshes its liveness.
+func (c *coordinator) authNode(r *http.Request) *Node {
+	key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := c.snap.Nodes[r.URL.Query().Get("node")]
+	if n == nil || subtle.ConstantTimeCompare([]byte(n.Key), []byte(key)) != 1 {
+		return nil
+	}
+	n.LastSeen = time.Now()
+	return n
+}
+
+func (c *coordinator) touch(nodeID string) {
+	c.mu.Lock()
+	if n := c.snap.Nodes[nodeID]; n != nil {
+		n.LastSeen = time.Now()
+	}
+	c.mu.Unlock()
+}
+
 func (c *coordinator) registerUser(w http.ResponseWriter, r *http.Request) {
 	var req proto.RegisterUserReq
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || strings.TrimSpace(req.Name) == "" {
@@ -58,6 +83,40 @@ func (c *coordinator) registerUser(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, proto.RegisterUserResp{UserID: u.ID, Token: u.Token})
 }
 
+func (c *coordinator) me(w http.ResponseWriter, r *http.Request) {
+	u := c.auth(r)
+	if u == nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	writeJSON(w, proto.Me{UserID: u.ID, Name: u.Name, Salt: u.Salt, Check: u.Check})
+}
+
+// setKeyInfo stores the public KDF salt + passphrase check, once.
+func (c *coordinator) setKeyInfo(w http.ResponseWriter, r *http.Request) {
+	u := c.auth(r)
+	if u == nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var ki proto.KeyInfo
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&ki); err != nil || len(ki.Salt) == 0 || len(ki.Check) == 0 {
+		http.Error(w, "salt and check required", http.StatusBadRequest)
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if u.Salt != nil {
+		http.Error(w, "key info already set", http.StatusConflict)
+		return
+	}
+	u.Salt, u.Check = ki.Salt, ki.Check
+	c.saveLocked()
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (c *coordinator) registerNode(w http.ResponseWriter, r *http.Request) {
 	u := c.auth(r)
 	if u == nil {
@@ -65,8 +124,8 @@ func (c *coordinator) registerNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req proto.RegisterNodeReq
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Addr == "" || req.Capacity <= 0 {
-		http.Error(w, "addr and positive capacity required", http.StatusBadRequest)
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Capacity <= 0 {
+		http.Error(w, "positive capacity required", http.StatusBadRequest)
 		return
 	}
 	c.mu.Lock()
@@ -81,38 +140,69 @@ func (c *coordinator) registerNode(w http.ResponseWriter, r *http.Request) {
 		n = &Node{ID: randID(8), Owner: u.ID, Key: randID(24)}
 		c.snap.Nodes[n.ID] = n
 	}
-	n.Addr, n.Capacity, n.LastSeen = strings.TrimRight(req.Addr, "/"), req.Capacity, time.Now()
+	n.Capacity, n.LastSeen = req.Capacity, time.Now()
 	c.saveLocked()
-	log.Printf("node %s registered: %s, %d MiB", n.ID, n.Addr, n.Capacity>>20)
+	log.Printf("node %s registered: %d MiB", n.ID, n.Capacity>>20)
 	writeJSON(w, proto.RegisterNodeResp{NodeID: n.ID, NodeKey: n.Key})
 }
 
-func (c *coordinator) heartbeat(w http.ResponseWriter, r *http.Request) {
-	var req proto.HeartbeatReq
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	n := c.snap.Nodes[req.NodeID]
-	if n == nil || subtle.ConstantTimeCompare([]byte(n.Key), []byte(req.NodeKey)) != 1 {
+// pollJob is the node's long-poll: it blocks up to 5s for work. Liveness is
+// refreshed at the start and end of each poll, so -offline-after must be > 5s.
+func (c *coordinator) pollJob(w http.ResponseWriter, r *http.Request) {
+	n := c.authNode(r)
+	if n == nil {
 		http.Error(w, "unknown node", http.StatusForbidden)
 		return
 	}
-	n.LastSeen = time.Now() // not persisted on every beat; saved on next change
+	defer c.touch(n.ID)
+	select {
+	case j := <-c.relay.queue(n.ID):
+		w.Header().Set(proto.HdrJobID, j.id)
+		w.Header().Set(proto.HdrOp, j.op)
+		w.Header().Set(proto.HdrChunkID, j.chunkID)
+		w.Write(j.body)
+	case <-time.After(5 * time.Second):
+		w.WriteHeader(http.StatusNoContent)
+	case <-r.Context().Done():
+	}
+}
+
+func (c *coordinator) jobResult(w http.ResponseWriter, r *http.Request) {
+	n := c.authNode(r)
+	if n == nil {
+		http.Error(w, "unknown node", http.StatusForbidden)
+		return
+	}
+	status, _ := strconv.Atoi(r.URL.Query().Get("status"))
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(c.chunkSize)+1024))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	c.relay.mu.Lock()
+	j := c.relay.jobs[r.URL.Query().Get("job")]
+	c.relay.mu.Unlock()
+	if j == nil || j.node != n.ID {
+		http.Error(w, "unknown job", http.StatusNotFound)
+		return
+	}
+	select {
+	case j.done <- jobResult{status: status, body: body}:
+	default:
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (c *coordinator) listNodes(w http.ResponseWriter, r *http.Request) {
-	if c.auth(r) == nil {
+	u := c.auth(r)
+	if u == nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	c.mu.Lock()
 	out := []proto.NodeInfo{}
 	for _, n := range c.snap.Nodes {
-		out = append(out, proto.NodeInfo{ID: n.ID, Owner: n.Owner, Addr: n.Addr, Capacity: n.Capacity,
+		out = append(out, proto.NodeInfo{ID: n.ID, Mine: n.Owner == u.ID, Capacity: n.Capacity,
 			Used: n.Used, Online: c.onlineLocked(n), LastSeen: n.LastSeen})
 	}
 	c.mu.Unlock()
@@ -131,9 +221,6 @@ func (c *coordinator) stats(w http.ResponseWriter, r *http.Request) {
 			s.Used += n.Used
 		}
 	}
-	for _, f := range c.snap.Files {
-		s.LogicalBytes += f.Size
-	}
 	writeJSON(w, s)
 }
 
@@ -147,7 +234,7 @@ func (c *coordinator) listFiles(w http.ResponseWriter, r *http.Request) {
 	out := []proto.FileInfo{}
 	for _, f := range c.snap.Files {
 		if f.Owner == u.ID {
-			out = append(out, proto.FileInfo{ID: f.ID, Name: f.Name, Size: f.Size, Chunks: len(f.Chunks), Created: f.Created})
+			out = append(out, proto.FileInfo{ID: f.ID, Meta: f.Meta, Size: f.Size, Chunks: len(f.Chunks), Created: f.Created})
 		}
 	}
 	c.mu.Unlock()
@@ -163,12 +250,12 @@ func (c *coordinator) upload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	name := r.URL.Query().Get("name")
-	if name == "" {
-		http.Error(w, "?name= required", http.StatusBadRequest)
+	meta, err := base64.RawURLEncoding.DecodeString(r.URL.Query().Get("meta"))
+	if err != nil || len(meta) == 0 || len(meta) > 4096 {
+		http.Error(w, "?meta= (base64url encrypted metadata) required", http.StatusBadRequest)
 		return
 	}
-	f := &File{ID: randID(8), Owner: u.ID, Name: name, Created: time.Now()}
+	f := &File{ID: randID(8), Owner: u.ID, Meta: meta, Created: time.Now()}
 	buf := make([]byte, c.chunkSize)
 	for i := 0; ; i++ {
 		n, err := io.ReadFull(r.Body, buf)
@@ -195,7 +282,7 @@ func (c *coordinator) upload(w http.ResponseWriter, r *http.Request) {
 	c.snap.Files[f.ID] = f
 	c.saveLocked()
 	c.mu.Unlock()
-	writeJSON(w, proto.FileInfo{ID: f.ID, Name: f.Name, Size: f.Size, Chunks: len(f.Chunks), Created: f.Created})
+	writeJSON(w, proto.FileInfo{ID: f.ID, Meta: f.Meta, Size: f.Size, Chunks: len(f.Chunks), Created: f.Created})
 }
 
 func (c *coordinator) placeChunk(fileID string, idx int, data []byte) (Chunk, error) {
@@ -210,7 +297,7 @@ func (c *coordinator) placeChunk(fileID string, idx int, data []byte) (Chunk, er
 		return ch, errors.New("no online node with enough free space")
 	}
 	for _, t := range targets {
-		if err := putChunk(t, ch.ID, data); err != nil {
+		if err := c.putChunk(t, ch.ID, data); err != nil {
 			log.Printf("put %s on %s: %v", ch.ID, t.ID, err)
 			c.mu.Lock()
 			c.releaseLocked(t.ID, size)
@@ -238,7 +325,7 @@ func (c *coordinator) deleteReplicas(ch Chunk) {
 		c.releaseLocked(id, ch.Size)
 		c.mu.Unlock()
 		if ok {
-			if err := delChunk(ref, ch.ID); err != nil {
+			if err := c.delChunk(ref, ch.ID); err != nil {
 				log.Printf("delete %s on %s: %v", ch.ID, id, err) // orphan stays on offline node
 			}
 		}
@@ -267,7 +354,6 @@ func (c *coordinator) download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Length", strconv.FormatInt(f.Size, 10))
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", f.Name))
 	for _, ch := range f.Chunks {
 		data, err := c.fetchChunk(ch)
 		if err != nil {
@@ -284,12 +370,12 @@ func (c *coordinator) fetchChunk(ch Chunk) ([]byte, error) {
 	var refs []nodeRef
 	for _, id := range ch.Nodes {
 		if nd := c.snap.Nodes[id]; nd != nil && c.onlineLocked(nd) {
-			refs = append(refs, nodeRef{nd.ID, nd.Addr, nd.Key})
+			refs = append(refs, nodeRef{nd.ID})
 		}
 	}
 	c.mu.Unlock()
 	for _, ref := range refs {
-		data, err := getChunk(ref, ch.ID)
+		data, err := c.getChunk(ref, ch.ID)
 		if err != nil {
 			continue
 		}

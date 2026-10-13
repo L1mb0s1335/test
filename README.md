@@ -1,30 +1,55 @@
-# p2pdrive — community-powered storage (MVP)
+# p2pdrive — community storage with end-to-end encryption
 
-Google Drive-like storage where the disks belong to the community. Anyone can
-donate space by running a `node`; anyone can store files. A central
-`coordinator` keeps metadata, splits files into chunks, replicates each chunk
-onto several nodes and repairs replication when nodes go offline.
+A Google Drive-like service where the disks belong to the community. Anyone
+can donate disk space by running the app; anyone can store files. A central
+**coordinator** keeps the directory and places replicas; the **app**
+(Windows / Linux) encrypts everything on your machine first, so **nobody but
+you can read your files** — not the coordinator, not the donors.
 
-    go build -o bin/ ./cmd/...
-    ./bin/coordinator -listen :8080 -replication 2 -chunk-mb 4
+    p2pdrive           desktop app: local UI opens in your browser
+    coordinator        server, run once by whoever hosts the community
 
-    export DRIVE_SERVER=http://localhost:8080
-    export DRIVE_TOKEN=$(./bin/drive register alice | sed 's/.*=//')
+## Quick start
 
-    # on any machine: donate 10 GiB
-    ./bin/node -coordinator $DRIVE_SERVER -public http://<reachable-host>:9000 -dir ./data -capacity-mb 10240
+    ./build.sh                                  # dist/ has Linux + Windows binaries
 
-    ./bin/drive upload photo.jpg
-    ./bin/drive ls
-    ./bin/drive get <id> out.jpg
-    ./bin/drive rm <id>
-    ./bin/drive nodes; ./bin/drive stats
+    # operator (any server; use TLS on the internet)
+    ./dist/coordinator-linux-amd64 -listen :8443 -tls-cert cert.pem -tls-key key.pem
 
-`scripts/demo.sh` runs a full scenario (3 nodes, upload, kill a node, repair, download).
+    # every user: run the app, it opens the UI
+    ./dist/p2pdrive-linux-amd64                  # or p2pdrive-windows-amd64.exe
 
-## Known MVP limits / next steps
-- Coordinator relays all data (bandwidth bottleneck) and nodes must be directly reachable (no NAT traversal).
-  Next: presigned URLs so clients talk to nodes directly; nodes behind NAT poll/long-connect to the coordinator.
-- Chunks are stored unencrypted. Next: client-side encryption (donors must not read others' files).
-- No fairness policy (e.g. quota proportional to donated space), no TLS, no per-user rate limits.
-- Metadata is a single JSON file; swap for SQLite/Postgres. Orphan chunks on nodes that were offline during delete are not GC'd.
+In the UI: connect to the coordinator → create an account → choose a
+passphrase → upload files. On the **Donate** tab pick a folder and how much
+space to give. Donating needs no open ports (nodes only connect outwards).
+Headless donor: `p2pdrive node`. CLI: `p2pdrive ls|put|get|rm` (needs
+`DRIVE_PASSPHRASE`). `scripts/demo.sh` runs a full end-to-end test.
+
+## Security model
+
+| Who | Sees |
+|---|---|
+| You | everything |
+| Coordinator | account name, random ids, ciphertext sizes, upload times, which nodes hold which chunk |
+| Donors | opaque encrypted chunks with random ids |
+
+- Passphrase → **Argon2id** (64 MiB, t=3) → master key; kept only in memory.
+- Every file gets a random 256-bit key; content is encrypted with
+  **AES-256-GCM in 1 MiB segments (STREAM construction)**: reordering, dropping,
+  truncating or modifying any segment is detected on download. Plus a SHA-256
+  per stored chunk. File names/sizes live in a metadata blob encrypted under the
+  master key.
+- Donors or the coordinator can **withhold or delete** data (replication + repair
+  mitigates this) but cannot read or undetectably alter it.
+- The local UI listens on 127.0.0.1 only, behind a random per-run access key,
+  Host-header check and anti-CSRF header.
+
+**Limits you should know**
+- **Lose the passphrase = lose the data.** No recovery, no passphrase change yet. Use a long one.
+- The account token (stored in the config file) lets someone delete your files or
+  fill your quota, but not read anything.
+- Use TLS for the coordinator: otherwise tokens cross the network in clear (file contents never do).
+- Not yet: file sharing between users, folders, quotas/fairness (e.g. space
+  proportional to what you donate), rollback detection, multiple coordinators.
+- The coordinator still relays all data (bandwidth bottleneck) and keeps metadata
+  in one JSON file — fine for an MVP/small community.

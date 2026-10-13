@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>p2pdrive</title>
+<link rel="icon" href="data:,">
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1c2330;--mut:#6b7587;--line:#e3e6ec;--acc:#2f6bff;--acc-fg:#fff;--ok:#1a9d5b;--err:#d23b3b}
+@media (prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1a1f28;--fg:#e8ecf3;--mut:#8b95a8;--line:#2a313d;--acc:#5b8aff;--acc-fg:#0b1020;--ok:#3ccf8e;--err:#ff6b6b}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
+header{display:flex;align-items:center;gap:16px;padding:12px 20px;background:var(--card);border-bottom:1px solid var(--line)}
+header h1{font-size:17px;margin:0;flex:0 0 auto}
+nav{display:flex;gap:4px;flex:1}
+nav button{background:none;border:0;color:var(--mut);padding:8px 12px;border-radius:8px;font:inherit;cursor:pointer}
+nav button.on{background:var(--bg);color:var(--fg);font-weight:600}
+main{max-width:860px;margin:24px auto;padding:0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:16px}
+h2{font-size:16px;margin:0 0 12px}
+label{display:block;font-size:13px;color:var(--mut);margin:12px 0 4px}
+input{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+button.p,button.s{padding:9px 16px;border-radius:8px;font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--card);color:var(--fg)}
+button.p{background:var(--acc);color:var(--acc-fg);border-color:var(--acc);font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:14px}
+.mut{color:var(--mut);font-size:13px}.err{color:var(--err)}.ok{color:var(--ok)}
+table{width:100%;border-collapse:collapse}
+td,th{padding:9px 6px;border-bottom:1px solid var(--line);text-align:left}
+th{font-size:12px;color:var(--mut);font-weight:500}
+td.r{text-align:right;white-space:nowrap}
+a{color:var(--acc);text-decoration:none;cursor:pointer}
+.bar{height:8px;background:var(--bg);border-radius:4px;overflow:hidden;border:1px solid var(--line)}
+.bar>i{display:block;height:100%;background:var(--acc)}
+.drop{border:2px dashed var(--line);border-radius:12px;padding:28px;text-align:center;color:var(--mut)}
+.drop.over{border-color:var(--acc);color:var(--fg)}
+code{background:var(--bg);padding:2px 6px;border-radius:6px;word-break:break-all}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:var(--mut)}
+.dot.on{background:var(--ok)}
+.hide{display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>🔒 p2pdrive</h1>
+  <nav id="nav" class="hide">
+    <button data-t="files" class="on">Мои файлы</button>
+    <button data-t="donate">Отдать место</button>
+    <button data-t="community">Сообщество</button>
+  </nav>
+  <button class="s hide" id="lockbtn">Заблокировать</button>
+</header>
+<main>
+  <div id="msg" class="mut"></div>
+
+  <section id="v-connect" class="hide">
+    <div class="card">
+      <h2>Подключение к координатору</h2>
+      <label>Адрес координатора</label>
+      <input id="c-server" placeholder="https://drive.example.com:8080">
+      <label>Токен аккаунта (если уже есть)</label>
+      <input id="c-token" placeholder="оставьте пустым, чтобы создать новый аккаунт">
+      <label>Имя нового аккаунта</label>
+      <input id="c-name" placeholder="например, alice">
+      <div class="row"><button class="p" id="c-go">Подключиться</button></div>
+      <p class="mut">Токен даёт доступ к аккаунту, но <b>не</b> к содержимому файлов: оно расшифровывается только вашей парольной фразой.</p>
+    </div>
+  </section>
+
+  <section id="v-unlock" class="hide">
+    <div class="card">
+      <h2 id="u-title">Разблокировка</h2>
+      <p class="mut" id="u-hint"></p>
+      <label>Парольная фраза</label>
+      <input id="u-pass" type="password" autocomplete="off">
+      <div id="u-confirm-wrap" class="hide"><label>Повторите</label><input id="u-pass2" type="password" autocomplete="off"></div>
+      <div class="row"><button class="p" id="u-go">Продолжить</button></div>
+      <p class="mut hide" id="u-warn"><b>Внимание:</b> парольную фразу нельзя восстановить. Если вы её потеряете, файлы будет невозможно расшифровать — никому, включая нас.</p>
+    </div>
+  </section>
+
+  <section id="v-files" class="hide">
+    <div class="card">
+      <div class="drop" id="drop">Перетащите файлы сюда или <a id="pick">выберите</a><input type="file" id="file" multiple class="hide"></div>
+      <div id="up" class="mut" style="margin-top:10px"></div>
+    </div>
+    <div class="card">
+      <h2>Файлы</h2>
+      <table><thead><tr><th>Имя</th><th>Размер</th><th>Дата</th><th></th></tr></thead><tbody id="list"></tbody></table>
+      <p class="mut" id="empty">Пока пусто.</p>
+    </div>
+  </section>
+
+  <section id="v-donate" class="hide">
+    <div class="card">
+      <h2>Отдать место сообществу</h2>
+      <p class="mut">Ваш компьютер хранит <b>зашифрованные</b> фрагменты чужих файлов. Прочитать их вы не сможете, а другие — ваши. Приложение должно быть запущено; входящие подключения не нужны.</p>
+      <label>Папка для хранения</label><input id="d-dir">
+      <label>Сколько отдать, МиБ</label><input id="d-cap" type="number" min="64">
+      <div class="row"><button class="p" id="d-start">Запустить</button><button class="s" id="d-stop">Остановить</button></div>
+      <p id="d-status" class="mut"></p>
+    </div>
+  </section>
+
+  <section id="v-community" class="hide">
+    <div class="card"><h2>Сеть</h2><div id="stats" class="mut"></div></div>
+    <div class="card"><h2>Узлы</h2>
+      <table><thead><tr><th>Узел</th><th>Статус</th><th>Занято</th><th></th></tr></thead><tbody id="nodes"></tbody></table></div>
+  </section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const H={'X-P2P':'1'};
+async function api(path,opt={}){
+  const r=await fetch(path,{...opt,headers:{...H,...(opt.headers||{})}});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error||r.statusText);
+  return j;
+}
+const post=(p,b)=>api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+function fmt(b){const u=['Б','КиБ','МиБ','ГиБ','ТиБ'];let i=0;while(b>=1024&&i<4){b/=1024;i++}return (i?b.toFixed(1):b)+' '+u[i]}
+function msg(t,cls){$('msg').textContent=t||'';$('msg').className=cls||'mut'}
+let tab='files',st={},timer;
+function show(id){document.querySelectorAll('main>section').forEach(s=>s.classList.toggle('hide',s.id!=='v-'+id))}
+
+async function refresh(){
+  try{st=await api('/api/state')}catch(e){return msg(e.message,'err')}
+  $('nav').classList.toggle('hide',!st.unlocked);
+  $('lockbtn').classList.toggle('hide',!st.unlocked);
+  if(!st.connected){show('connect');return}
+  if(st.error){msg(st.error,'err');show('connect');$('c-server').value=st.server||'';return}
+  if(!st.unlocked){
+    show('unlock');
+    const first=!st.has_key;
+    $('u-title').textContent=first?'Придумайте парольную фразу':'Введите парольную фразу';
+    $('u-hint').textContent=(st.user?'Аккаунт: '+st.user+'. ':'')+(first?'Ею шифруются все ваши файлы и их имена. Она никогда не покидает этот компьютер.':'');
+    $('u-confirm-wrap').classList.toggle('hide',!first);
+    $('u-warn').classList.toggle('hide',!first);
+    return;
+  }
+  msg('');
+  show(tab);
+  if(tab==='files')loadFiles();
+  if(tab==='donate')renderDonate();
+  if(tab==='community')loadCommunity();
+}
+
+$('c-go').onclick=async()=>{
+  try{
+    const r=await post('/api/connect',{server:$('c-server').value.trim(),token:$('c-token').value.trim(),name:$('c-token').value.trim()?'':$('c-name').value.trim()});
+    if(!$('c-token').value.trim()) alert('Ваш токен (сохраните его для входа с другого устройства):\n\n'+r.token);
+    msg(''); refresh();
+  }catch(e){msg(e.message,'err')}
+};
+$('u-go').onclick=async()=>{
+  const first=!st.has_key;
+  if(first&&$('u-pass').value!==$('u-pass2').value) return msg('Фразы не совпадают','err');
+  try{await post('/api/unlock',{passphrase:$('u-pass').value,create:first});$('u-pass').value=$('u-pass2').value='';msg('');refresh()}
+  catch(e){msg(e.message,'err')}
+};
+$('u-pass').onkeydown=e=>{if(e.key==='Enter')$('u-go').click()};
+$('lockbtn').onclick=async()=>{await post('/api/lock');refresh()};
+$('nav').onclick=e=>{const t=e.target.dataset.t;if(!t)return;tab=t;
+  document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));refresh()};
+
+// files
+async function loadFiles(){
+  try{
+    const fs=await api('/api/files');
+    $('empty').classList.toggle('hide',fs.length>0);
+    const tb=$('list');tb.innerHTML='';
+    fs.sort((a,b)=>b.created.localeCompare(a.created)).forEach(f=>{
+      const tr=document.createElement('tr');
+      const nm=document.createElement('td');nm.textContent=f.name;
+      const sz=document.createElement('td');sz.textContent=fmt(f.size);
+      const dt=document.createElement('td');dt.textContent=new Date(f.created).toLocaleString();
+      const ac=document.createElement('td');ac.className='r';
+      const dl=document.createElement('a');dl.textContent='Скачать';dl.href='/api/download/'+encodeURIComponent(f.id);
+      const rm=document.createElement('a');rm.textContent='Удалить';rm.style.marginLeft='12px';
+      rm.onclick=async()=>{if(confirm('Удалить «'+f.name+'»?')){await api('/api/files/'+f.id,{method:'DELETE'});loadFiles()}};
+      ac.append(dl,rm);tr.append(nm,sz,dt,ac);tb.append(tr);
+    });
+  }catch(e){msg(e.message,'err')}
+}
+function uploadOne(file){
+  return new Promise(res=>{
+    const x=new XMLHttpRequest();
+    x.open('POST','/api/upload?name='+encodeURIComponent(file.name));
+    x.setRequestHeader('X-P2P','1');
+    x.upload.onprogress=e=>{$('up').textContent=file.name+': '+Math.round(100*e.loaded/e.total)+'% (шифруется и отправляется)'};
+    x.onload=()=>{if(x.status>=300){let m='ошибка';try{m=JSON.parse(x.responseText).error}catch{}$('up').textContent=file.name+': '+m;$('up').className='err'}res()};
+    x.onerror=()=>{$('up').textContent=file.name+': ошибка сети';res()};
+    x.send(file);
+  });
+}
+async function uploadAll(files){
+  $('up').className='mut';
+  for(const f of files) await uploadOne(f);
+  if($('up').className!=='err') $('up').textContent='Готово';
+  loadFiles();
+}
+$('pick').onclick=()=>$('file').click();
+$('file').onchange=e=>uploadAll([...e.target.files]);
+const dz=$('drop');
+dz.ondragover=e=>{e.preventDefault();dz.classList.add('over')};
+dz.ondragleave=()=>dz.classList.remove('over');
+dz.ondrop=e=>{e.preventDefault();dz.classList.remove('over');uploadAll([...e.dataTransfer.files])};
+
+// donate
+function renderDonate(){
+  const c=st.node_cfg||{};
+  if(document.activeElement!==$('d-dir')&&!$('d-dir').value)$('d-dir').value=c.dir||'';
+  if(document.activeElement!==$('d-cap')&&!$('d-cap').value)$('d-cap').value=c.capacity_mb||10240;
+  const n=st.node;
+  $('d-start').disabled=!!n;$('d-stop').disabled=!n;
+  $('d-status').innerHTML=n?'<span class="dot '+(n.online?'on':'')+'"></span>'+(n.online?'Работает':'Подключение…')+' · занято '+fmt(n.used)+' из '+fmt(n.capacity)+(n.error?' · <span class="err">'+n.error+'</span>':''):'Остановлено';
+}
+$('d-start').onclick=async()=>{try{await post('/api/node/start',{dir:$('d-dir').value,capacity_mb:+$('d-cap').value});refresh()}catch(e){msg(e.message,'err')}};
+$('d-stop').onclick=async()=>{await post('/api/node/stop');refresh()};
+
+// community
+async function loadCommunity(){
+  try{
+    const r=await api('/api/community'),s=r.stats;
+    $('stats').innerHTML='Участников: <b>'+s.users+'</b> · узлов онлайн: <b>'+s.nodes_online+'/'+s.nodes_total+'</b> · пул: <b>'+fmt(s.capacity_online)+'</b> · занято: <b>'+fmt(s.used_online)+'</b> · файлов: <b>'+s.files+'</b> · копий каждого фрагмента: <b>'+s.replication+'</b>';
+    const tb=$('nodes');tb.innerHTML='';
+    r.nodes.forEach(n=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML='<td></td><td></td><td></td><td class="mut"></td>';
+      tr.children[0].textContent=n.id;
+      tr.children[1].innerHTML='<span class="dot '+(n.online?'on':'')+'"></span>'+(n.online?'онлайн':'офлайн');
+      const pct=Math.min(100,100*n.used/n.capacity);
+      tr.children[2].innerHTML='<div class="bar"><i style="width:'+pct+'%"></i></div><span class="mut">'+fmt(n.used)+' / '+fmt(n.capacity)+'</span>';
+      tr.children[3].textContent=n.mine?'ваш':'';
+      tb.append(tr);
+    });
+  }catch(e){msg(e.message,'err')}
+}
+refresh();
+timer=setInterval(()=>{if(st.unlocked&&(tab==='donate'||tab==='community'))refresh()},4000);
+</script>
+</body>
+</html>

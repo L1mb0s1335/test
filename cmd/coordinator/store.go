@@ -14,13 +14,14 @@ type User struct {
 	ID    string `json:"id"`
 	Name  string `json:"name"`
 	Token string `json:"token"`
+	Salt  []byte `json:"salt,omitempty"`
+	Check []byte `json:"check,omitempty"`
 }
 
 type Node struct {
 	ID       string    `json:"id"`
 	Owner    string    `json:"owner"`
 	Key      string    `json:"key"`
-	Addr     string    `json:"addr"`
 	Capacity int64     `json:"capacity"`
 	Used     int64     `json:"used"` // bytes the coordinator has placed here
 	LastSeen time.Time `json:"last_seen"`
@@ -36,7 +37,7 @@ type Chunk struct {
 type File struct {
 	ID      string    `json:"id"`
 	Owner   string    `json:"owner"`
-	Name    string    `json:"name"`
+	Meta    []byte    `json:"meta"` // encrypted by the client; opaque here
 	Size    int64     `json:"size"`
 	Chunks  []Chunk   `json:"chunks"`
 	Created time.Time `json:"created"`
@@ -55,10 +56,11 @@ type coordinator struct {
 	chunkSize int
 	offline   time.Duration
 	snap      snapshot
+	relay     *relay
 }
 
 func newCoordinator(path string, repl, chunkSize int, offline time.Duration) *coordinator {
-	c := &coordinator{path: path, repl: repl, chunkSize: chunkSize, offline: offline}
+	c := &coordinator{relay: newRelay(), path: path, repl: repl, chunkSize: chunkSize, offline: offline}
 	c.snap = snapshot{Users: map[string]*User{}, Nodes: map[string]*Node{}, Files: map[string]*File{}}
 	if b, err := os.ReadFile(path); err == nil {
 		if err := json.Unmarshal(b, &c.snap); err != nil {

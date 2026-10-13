@@ -26,7 +26,7 @@ func (c *coordinator) pickNodesLocked(n int, size int64, exclude map[string]bool
 	out := make([]nodeRef, len(cand))
 	for i, nd := range cand {
 		nd.Used += size
-		out[i] = nodeRef{nd.ID, nd.Addr, nd.Key}
+		out[i] = nodeRef{nd.ID}
 	}
 	return out
 }
@@ -45,5 +45,5 @@ func (c *coordinator) refLocked(id string) (nodeRef, bool) {
 	if nd == nil {
 		return nodeRef{}, false
 	}
-	return nodeRef{nd.ID, nd.Addr, nd.Key}, true
+	return nodeRef{nd.ID}, true
 }
